@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sys
+import tomllib
 from datetime import datetime
 from pathlib import Path
 
@@ -25,6 +26,72 @@ Template: example-report.docx
      - language, tone, length
      Lines inside this comment are ignored. -->
 """
+
+
+CONFIG_SKELETON = """\
+# docforge settings for this project. Command-line options and environment variables override
+# this file. Remove the leading "#" from a line to use it.
+
+# --- Claude API (default) ---
+# provider = "anthropic"
+# model = "claude-opus-5-5"
+# effort = "high"                  # low | medium | high | xhigh | max
+
+# --- Any OpenAI-compatible API (OpenAI, Azure, OpenRouter, Ollama, LM Studio, vLLM, ...) ---
+# provider = "openai"
+# base_url = "http://localhost:11434/v1"
+# model = "qwen3:32b"
+# api_key_env = "DOCFORGE_API_KEY" # name of the environment variable holding the key
+# json_mode = "auto"               # auto | schema | object | none
+# send_images = true               # set false for models without vision
+# max_tokens = 16000               # output limit; leave out to use the server's default
+"""
+
+
+def load_settings(args, project: Path):
+    """Settings from command line > environment > docforge.toml > defaults."""
+    from .llm import DEFAULT_CLAUDE_MODEL, Settings
+
+    cfg = {}
+    path = project / "docforge.toml"
+    if path.is_file():
+        try:
+            cfg = tomllib.loads(path.read_text(encoding="utf-8-sig"))
+        except tomllib.TOMLDecodeError as exc:
+            raise SystemExit(f"Error in {path}: {exc}")
+    env = os.environ
+
+    def pick(flag, env_name, key, default=None):
+        value = getattr(args, flag, None)
+        if value is None:
+            value = env.get(env_name) or cfg.get(key)
+        return default if value is None else value
+
+    base_url = pick("base_url", "DOCFORGE_BASE_URL", "base_url")
+    provider = str(pick("provider", "DOCFORGE_PROVIDER", "provider", "openai" if base_url else "anthropic")).lower()
+    if provider not in ("anthropic", "openai"):
+        raise SystemExit(f"Unknown provider {provider!r}: use 'anthropic' or 'openai'.")
+    model = pick("model", "DOCFORGE_MODEL", "model", DEFAULT_CLAUDE_MODEL if provider == "anthropic" else None)
+    if not model:
+        raise SystemExit("No model set for the OpenAI-compatible provider: use --model, DOCFORGE_MODEL or docforge.toml.")
+    if provider == "openai":
+        key_env = cfg.get("api_key_env")
+        api_key = env.get(key_env) if key_env else env.get("DOCFORGE_API_KEY") or env.get("OPENAI_API_KEY")
+        if key_env and not api_key:
+            raise SystemExit(f"Environment variable {key_env} (api_key_env in docforge.toml) is not set.")
+    else:
+        api_key = None  # the Claude client reads ANTHROPIC_API_KEY itself
+    json_mode = str(pick("json_mode", "DOCFORGE_JSON_MODE", "json_mode", "auto"))
+    if json_mode not in ("auto", "schema", "object", "none"):
+        raise SystemExit(f"Unknown json_mode {json_mode!r}: use auto, schema, object or none.")
+    max_tokens = pick("max_tokens", "DOCFORGE_MAX_TOKENS", "max_tokens")
+    send_images = cfg.get("send_images", True) and not getattr(args, "no_images", False)
+    return Settings(
+        provider=provider, model=str(model), base_url=base_url, api_key=api_key,
+        effort=pick("effort", "DOCFORGE_EFFORT", "effort"),
+        max_tokens=int(max_tokens) if max_tokens else None,
+        json_mode=json_mode, send_images=bool(send_images),
+    )
 
 
 def _templates(project: Path) -> list[Path]:
@@ -70,6 +137,9 @@ def cmd_init(args) -> int:
     prompt = project / "prompt.md"
     if not prompt.exists():
         prompt.write_text(PROMPT_SKELETON, encoding="utf-8")
+    config = project / "docforge.toml"
+    if not config.exists():
+        config.write_text(CONFIG_SKELETON, encoding="utf-8")
     if args.sample:
         from .sample import write_sample
 
@@ -78,6 +148,7 @@ def cmd_init(args) -> int:
     print("  templates/  put your Word templates (.docx/.dotx) here")
     print("  research/   put your research files here")
     print("  prompt.md   describe the document you want")
+    print("  docforge.toml  model/provider settings (optional)")
     print("Then run:  docforge build")
     return 0
 
@@ -114,8 +185,8 @@ def cmd_build(args) -> int:
 
     prompt = _read_prompt(args, project)
     templates = _templates(project)
-    model = args.model
-    client = None
+    settings = load_settings(args, project)
+    backend = None
 
     if args.template:
         template_path = _resolve_template(project, args.template)
@@ -132,16 +203,18 @@ def cmd_build(args) -> int:
     else:
         from . import llm
 
-        client = llm.make_client()
         print("Choosing template...")
         descriptions = {t.name: template.describe(template.open_template(t), t.name) for t in templates}
         try:
-            chosen = llm.choose_template(client, model, descriptions, prompt)
+            backend = llm.make_backend(settings)
+            chosen = llm.choose_template(backend, descriptions, prompt)
         except llm.LLMError as exc:
             raise SystemExit(str(exc))
         template_path = next(t for t in templates if t.name == chosen)
 
-    blocks, loaded, skipped = research.load(project / "research")
+    blocks, loaded, skipped = research.load(
+        project / "research", native_pdf=settings.provider == "anthropic", images=settings.send_images
+    )
     if template_path is not None:
         print(f"Template: {template_path.name}")
         description = template.describe(template.open_template(template_path), template_path.name)
@@ -152,17 +225,17 @@ def cmd_build(args) -> int:
     if args.dry_run:
         if template_path is not None:
             print("\n" + description)
-        print(f"\nInstructions:\n{prompt}\n\nDry run: nothing was sent to the model.")
+        print(f"\nInstructions:\n{prompt}\n\nModel: {settings.describe()}")
+        print("Dry run: nothing was sent to the model.")
         return 0
 
     from . import llm
 
-    client = client or llm.make_client()
-    print(f"Writing document with {model} (effort {args.effort}); this can take several minutes.")
+    print(f"Writing document with {settings.describe()}; this can take several minutes.")
     try:
+        backend = backend or llm.make_backend(settings)
         result = llm.write_document(
-            client, model=model, effort=args.effort, max_tokens=args.max_tokens,
-            research_blocks=blocks, template_description=description, prompt=prompt,
+            backend, research_blocks=blocks, template_description=description, prompt=prompt,
         )
     except llm.LLMError as exc:
         raise SystemExit(str(exc))
@@ -231,9 +304,15 @@ def main(argv=None) -> int:
     p.add_argument("-m", "--message", help="give the instructions directly instead of a prompt file")
     p.add_argument("-t", "--template", help="template to use (default: taken from the prompt)")
     p.add_argument("-o", "--output", help="output .docx (default: output/<template>-<timestamp>.docx)")
-    p.add_argument("--model", default=os.environ.get("DOCFORGE_MODEL", "claude-opus-5-5"))
-    p.add_argument("--effort", default="high", choices=["low", "medium", "high", "xhigh", "max"])
-    p.add_argument("--max-tokens", type=int, default=64000, help="output limit for the model (default 64000)")
+    p.add_argument("--provider", choices=["anthropic", "openai"],
+                   help="anthropic (Claude API, default) or openai (any OpenAI-compatible API)")
+    p.add_argument("--base-url", help="API base URL, e.g. http://localhost:11434/v1")
+    p.add_argument("--model", help="model name (default for the Claude API: claude-opus-5-5)")
+    p.add_argument("--effort", help="reasoning effort (Claude API default: high)")
+    p.add_argument("--max-tokens", type=int, help="output limit for the model")
+    p.add_argument("--json-mode", choices=["auto", "schema", "object", "none"],
+                   help="openai provider: how to request JSON (default auto)")
+    p.add_argument("--no-images", action="store_true", help="do not send image files to the model")
     p.add_argument("--body-style", help="Word paragraph style for generated body text (default: detected)")
     p.add_argument("--dry-run", action="store_true", help="show what would be sent, without calling the model")
     p.add_argument("--from-json", help="re-render a saved output/*.json without calling the model")

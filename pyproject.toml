@@ -6,11 +6,13 @@ build-backend = "setuptools.build_meta"
 name = "docforge"
 version = "0.1.0"
 description = "Generate Word documents from Word templates, research files and an LLM prompt"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "anthropic>=2.0",
     "python-docx>=1.1",
     "openpyxl>=3.1",
+    "openai>=1.40",
+    "pypdf>=4.0",
 ]
 
 [project.optional-dependencies]

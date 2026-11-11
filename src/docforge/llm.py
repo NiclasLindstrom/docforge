@@ -1,13 +1,17 @@
-"""Claude API calls: choose a template and write the document content."""
+"""LLM calls: choose a template and write the document content.
+
+Two backends: the Claude API (default) and any OpenAI-compatible chat completions API.
+Content is built once as Claude-style content blocks; the OpenAI backend converts them.
+"""
 
 from __future__ import annotations
 
 import json
+import re
 import sys
+from dataclasses import dataclass
 
-import anthropic
-
-DEFAULT_MODEL = "claude-opus-5-5"
+DEFAULT_CLAUDE_MODEL = "claude-opus-5-5"
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
 SYSTEM = """\
@@ -104,86 +108,247 @@ class LLMError(Exception):
     pass
 
 
-_NO_KEY = (
-    "No valid Claude API key found. Set one first, e.g. in PowerShell:\n"
-    '  $env:ANTHROPIC_API_KEY = "sk-ant-..."'
-)
+@dataclass
+class Settings:
+    provider: str = "anthropic"  # "anthropic" or "openai" (any OpenAI-compatible API)
+    model: str = DEFAULT_CLAUDE_MODEL
+    base_url: str | None = None
+    api_key: str | None = None
+    effort: str | None = None
+    max_tokens: int | None = None
+    json_mode: str = "auto"  # openai only: auto | schema | object | none
+    send_images: bool = True
+
+    def describe(self) -> str:
+        where = f" at {self.base_url}" if self.base_url else ""
+        return f"{self.model} ({'Claude API' if self.provider == 'anthropic' else 'OpenAI-compatible API'}{where})"
 
 
-def _extra(model: str) -> dict:
-    """Request options that only some models take."""
-    if model.startswith(("claude-opus-5", "claude-fable-5", "claude-mythos-5", "claude-sonnet-5-5")):
-        # If the model's safety classifier declines, the API retries on a fallback model.
-        return {"betas": [FALLBACK_BETA], "fallbacks": "default"}
-    return {}
+def _progress(chars: int):
+    print(f"\r  writing... {chars:,} characters", end="", file=sys.stderr, flush=True)
 
 
-def _run(client, *, model, effort, schema, system, content, max_tokens, progress=False) -> dict:
+def _parse_json(text: str) -> dict:
+    """Parse the model's JSON, tolerating reasoning tags and code fences around it."""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
+    start, end = text.find("{"), text.rfind("}")
     try:
-        with client.beta.messages.stream(
-            model=model,
-            max_tokens=max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": content}],
-            output_config={"effort": effort, "format": {"type": "json_schema", "schema": schema}},
-            **_extra(model),
-        ) as stream:
-            chars = 0
-            for text in stream.text_stream:
-                chars += len(text)
-                if progress:
-                    print(f"\r  writing... {chars:,} characters", end="", file=sys.stderr, flush=True)
-            if progress:
-                print(file=sys.stderr)
-            message = stream.get_final_message()
-    except anthropic.AuthenticationError as exc:
-        raise LLMError(_NO_KEY) from exc
-    except anthropic.RateLimitError as exc:
-        raise LLMError(f"Rate limited by the Claude API, try again shortly: {exc.message}") from exc
-    except anthropic.BadRequestError as exc:
-        raise LLMError(
-            f"The Claude API rejected the request: {exc.message}\n"
-            "If this is about prompt length or request size, remove or split some research files."
-        ) from exc
-    except anthropic.APIStatusError as exc:
-        raise LLMError(f"Claude API error {exc.status_code}: {exc.message}") from exc
-    except anthropic.APIConnectionError as exc:
-        raise LLMError(f"Could not reach the Claude API: {exc}") from exc
-    except TypeError as exc:  # no credentials configured at all
-        if "authentication" not in str(exc):
-            raise
-        raise LLMError(_NO_KEY) from exc
-
-    if message.stop_reason == "refusal":
-        raise LLMError("The model declined to write this document.")
-    if message.stop_reason == "max_tokens":
-        raise LLMError(
-            "The document did not fit in the output limit. Raise --max-tokens (up to 128000) "
-            "or ask for a shorter document in the prompt."
-        )
-    text = "".join(b.text for b in message.content if b.type == "text")
-    try:
-        data = json.loads(text)
+        data = json.loads(text[start:end + 1]) if start >= 0 else None
     except json.JSONDecodeError as exc:
         raise LLMError(f"The model returned invalid JSON: {exc}") from exc
-    data["_usage"] = {
-        "model": message.model,
-        "input_tokens": message.usage.input_tokens,
-        "cache_read_input_tokens": message.usage.cache_read_input_tokens or 0,
-        "output_tokens": message.usage.output_tokens,
-    }
+    if not isinstance(data, dict):
+        raise LLMError("The model did not return a JSON object.")
     return data
 
 
-def make_client():
-    return anthropic.Anthropic(timeout=1800.0)
+# --------------------------------------------------------------------------- Claude API
+
+class ClaudeBackend:
+    def __init__(self, settings: Settings):
+        import anthropic
+
+        self.s = settings
+        kwargs = {"timeout": 1800.0}
+        if settings.base_url:
+            kwargs["base_url"] = settings.base_url
+        if settings.api_key:
+            kwargs["api_key"] = settings.api_key
+        self.client = anthropic.Anthropic(**kwargs)
+
+    _NO_KEY = (
+        "No valid Claude API key found. Set one first, e.g. in PowerShell:\n"
+        '  $env:ANTHROPIC_API_KEY = "sk-ant-..."'
+    )
+
+    def _extra(self) -> dict:
+        if self.s.model.startswith(("claude-opus-5", "claude-fable-5", "claude-mythos-5", "claude-sonnet-5-5")):
+            # If the model's safety classifier declines, the API retries on a fallback model.
+            return {"betas": [FALLBACK_BETA], "fallbacks": "default"}
+        return {}
+
+    def run(self, *, schema, system, content, effort=None, max_tokens=None, progress=False) -> dict:
+        import anthropic
+
+        try:
+            with self.client.beta.messages.stream(
+                model=self.s.model,
+                max_tokens=max_tokens or self.s.max_tokens or 64000,
+                system=system,
+                messages=[{"role": "user", "content": content}],
+                output_config={
+                    "effort": effort or self.s.effort or "high",
+                    "format": {"type": "json_schema", "schema": schema},
+                },
+                **self._extra(),
+            ) as stream:
+                chars = 0
+                for text in stream.text_stream:
+                    chars += len(text)
+                    if progress:
+                        _progress(chars)
+                if progress:
+                    print(file=sys.stderr)
+                message = stream.get_final_message()
+        except anthropic.AuthenticationError as exc:
+            raise LLMError(self._NO_KEY) from exc
+        except anthropic.RateLimitError as exc:
+            raise LLMError(f"Rate limited by the Claude API, try again shortly: {exc.message}") from exc
+        except anthropic.BadRequestError as exc:
+            raise LLMError(
+                f"The Claude API rejected the request: {exc.message}\n"
+                "If this is about prompt length or request size, remove or split some research files."
+            ) from exc
+        except anthropic.APIStatusError as exc:
+            raise LLMError(f"Claude API error {exc.status_code}: {exc.message}") from exc
+        except anthropic.APIConnectionError as exc:
+            raise LLMError(f"Could not reach the Claude API: {exc}") from exc
+        except TypeError as exc:  # no credentials configured at all
+            if "authentication" not in str(exc):
+                raise
+            raise LLMError(self._NO_KEY) from exc
+
+        if message.stop_reason == "refusal":
+            raise LLMError("The model declined to write this document.")
+        if message.stop_reason == "max_tokens":
+            raise LLMError(
+                "The document did not fit in the output limit. Raise --max-tokens (up to 128000) "
+                "or ask for a shorter document in the prompt."
+            )
+        data = _parse_json("".join(b.text for b in message.content if b.type == "text"))
+        data["_usage"] = {
+            "model": message.model,
+            "input_tokens": message.usage.input_tokens,
+            "cache_read_input_tokens": message.usage.cache_read_input_tokens or 0,
+            "output_tokens": message.usage.output_tokens,
+        }
+        return data
 
 
-def choose_template(client, model: str, descriptions: dict[str, str], prompt: str) -> str:
+# --------------------------------------------------------------------------- OpenAI-compatible
+
+class OpenAIBackend:
+    """Any server that implements the OpenAI chat completions API."""
+
+    def __init__(self, settings: Settings):
+        try:
+            import openai
+        except ImportError as exc:
+            raise LLMError("The OpenAI-compatible provider needs the 'openai' package: pip install openai") from exc
+        self.s = settings
+        key = settings.api_key
+        if not key:
+            if not settings.base_url:
+                raise LLMError(
+                    "No API key for the OpenAI-compatible provider. Set one, e.g. in PowerShell:\n"
+                    '  $env:DOCFORGE_API_KEY = "..."'
+                )
+            key = "not-needed"  # local servers (Ollama, LM Studio, ...) ignore the key
+        self.client = openai.OpenAI(api_key=key, base_url=settings.base_url, timeout=1800.0)
+
+    @staticmethod
+    def _convert(content: list[dict]) -> list[dict]:
+        parts = []
+        for block in content:
+            if block["type"] == "text":
+                parts.append({"type": "text", "text": block["text"]})
+            elif block["type"] == "image":
+                src = block["source"]
+                parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{src['media_type']};base64,{src['data']}"},
+                })
+            else:
+                raise LLMError(f"Cannot send a {block['type']!r} block to an OpenAI-compatible API.")
+        return parts
+
+    def _formats(self, schema) -> list:
+        as_schema = {"type": "json_schema", "json_schema": {"name": "result", "strict": True, "schema": schema}}
+        as_object = {"type": "json_object"}
+        return {
+            "schema": [as_schema], "object": [as_object], "none": [None],
+            "auto": [as_schema, as_object, None],  # step down if the server rejects a format
+        }[self.s.json_mode]
+
+    def run(self, *, schema, system, content, effort=None, max_tokens=None, progress=False) -> dict:
+        import openai
+
+        params = {
+            "model": self.s.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": system + "\n\nReturn only a JSON object, with no text around it, "
+                    "that conforms to this JSON Schema:\n" + json.dumps(schema),
+                },
+                {"role": "user", "content": self._convert(content)},
+            ],
+            "stream": True,
+        }
+        if self.s.max_tokens:
+            params["max_tokens"] = self.s.max_tokens
+        if self.s.effort:
+            params["reasoning_effort"] = self.s.effort
+
+        formats = self._formats(schema)
+        try:
+            for i, fmt in enumerate(formats):
+                if fmt is not None:
+                    params["response_format"] = fmt
+                else:
+                    params.pop("response_format", None)
+                try:
+                    stream = self.client.chat.completions.create(**params)
+                    text, finish = "", None
+                    for chunk in stream:
+                        if not chunk.choices:
+                            continue
+                        text += chunk.choices[0].delta.content or ""
+                        finish = chunk.choices[0].finish_reason or finish
+                        if progress:
+                            _progress(len(text))
+                    break
+                except (openai.BadRequestError, openai.UnprocessableEntityError):
+                    if i == len(formats) - 1:
+                        raise
+        except openai.AuthenticationError as exc:
+            raise LLMError(f"The API rejected the key: {exc.message}") from exc
+        except openai.RateLimitError as exc:
+            raise LLMError(f"Rate limited by the API, try again shortly: {exc.message}") from exc
+        except openai.NotFoundError as exc:
+            raise LLMError(f"Not found - check the model name and base URL: {exc.message}") from exc
+        except openai.APIStatusError as exc:
+            raise LLMError(
+                f"API error {exc.status_code}: {exc.message}\n"
+                "If this is about context length, remove or split some research files. If it is about "
+                "images, set send_images = false."
+            ) from exc
+        except openai.APIConnectionError as exc:
+            raise LLMError(f"Could not reach the API at {self.client.base_url}: {exc}") from exc
+        if progress:
+            print(file=sys.stderr)
+
+        if finish == "length":
+            raise LLMError(
+                "The output was cut off at the model's output limit. Raise max_tokens (or the "
+                "server's context size), or ask for a shorter document in the prompt."
+            )
+        if finish == "content_filter":
+            raise LLMError("The provider's content filter stopped the response.")
+        return _parse_json(text)
+
+
+def make_backend(settings: Settings):
+    return (ClaudeBackend if settings.provider == "anthropic" else OpenAIBackend)(settings)
+
+
+# --------------------------------------------------------------------------- tasks
+
+def choose_template(backend, descriptions: dict[str, str], prompt: str) -> str:
     """Ask the model which template the author's instructions call for."""
+    names = sorted(descriptions)
     schema = {
         "type": "object",
-        "properties": {"template": {"type": "string", "enum": sorted(descriptions)}},
+        "properties": {"template": {"type": "string", "enum": names}},
         "required": ["template"],
         "additionalProperties": False,
     }
@@ -193,25 +358,31 @@ def choose_template(client, model: str, descriptions: dict[str, str], prompt: st
         + f"\n\nThe author's instructions:\n<instructions>\n{prompt}\n</instructions>\n\n"
         "Which template do the instructions call for?",
     }]
-    data = _run(
-        client, model=model, effort="low", schema=schema, max_tokens=2000, content=content,
+    data = backend.run(
+        schema=schema, content=content, max_tokens=2000,
+        effort="low" if backend.s.provider == "anthropic" else None,
         system="You pick the Word template that best matches the author's instructions.",
     )
+    if data.get("template") not in names:
+        raise LLMError(f"The model chose a template that does not exist: {data.get('template')!r}. Use --template.")
     return data["template"]
 
 
-def write_document(client, *, model, effort, max_tokens, research_blocks, template_description, prompt) -> dict:
+def write_document(backend, *, research_blocks, template_description, prompt) -> dict:
     content = list(research_blocks)
     if content:
         # Research is the large, stable part: cache it so re-runs with an edited prompt are cheaper.
-        content[-1] = {**content[-1], "cache_control": {"type": "ephemeral"}}
+        if backend.s.provider == "anthropic":
+            content[-1] = {**content[-1], "cache_control": {"type": "ephemeral"}}
     else:
         content.append({"type": "text", "text": "(No research files were provided.)"})
     content.append({
         "type": "text",
         "text": f"{template_description}\n\nThe author's instructions:\n<instructions>\n{prompt}\n</instructions>",
     })
-    return _run(
-        client, model=model, effort=effort, schema=RESULT_SCHEMA, system=SYSTEM,
-        content=content, max_tokens=max_tokens, progress=True,
-    )
+    data = backend.run(schema=RESULT_SCHEMA, system=SYSTEM, content=content, progress=True)
+    if not isinstance(data.get("sections"), list):
+        raise LLMError("The model's answer has no 'sections' list; try again or use a more capable model.")
+    data.setdefault("fields", [])
+    data.setdefault("notes", [])
+    return data

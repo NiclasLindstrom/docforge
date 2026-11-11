@@ -49,6 +49,15 @@ def _xlsx_text(path: Path) -> str:
     return "\n".join(out)
 
 
+def _pdf_text(path: Path) -> str:
+    from pypdf import PdfReader
+
+    pages = [(page.extract_text() or "").strip() for page in PdfReader(str(path)).pages]
+    if not any(pages):
+        raise ValueError("no extractable text; scanned PDFs need the Claude API provider")
+    return "\n\n".join(f"[page {i}]\n{t}" for i, t in enumerate(pages, 1) if t)
+
+
 def _b64(path: Path) -> str:
     return base64.standard_b64encode(path.read_bytes()).decode("ascii")
 
@@ -59,8 +68,11 @@ def list_files(folder: Path) -> list[Path]:
     return sorted(p for p in folder.rglob("*") if p.is_file() and not p.name.startswith(("~$", ".")))
 
 
-def load(folder: Path) -> tuple[list[dict], list[str], list[str]]:
-    """Return (content blocks, names of loaded files, names of skipped files)."""
+def load(folder: Path, native_pdf: bool = True, images: bool = True) -> tuple[list[dict], list[str], list[str]]:
+    """Return (content blocks, names of loaded files, names of skipped files).
+
+    native_pdf: send PDFs as files (Claude API). Otherwise their text is extracted locally.
+    """
     blocks: list[dict] = []
     loaded, skipped = [], []
     for path in list_files(folder):
@@ -73,6 +85,8 @@ def load(folder: Path) -> tuple[list[dict], list[str], list[str]]:
                 text = _docx_text(path)
             elif suffix in (".xlsx", ".xlsm"):
                 text = _xlsx_text(path)
+            elif suffix == ".pdf" and not native_pdf:
+                text = _pdf_text(path)
             elif suffix == ".pdf":
                 blocks.append({
                     "type": "document",
@@ -80,6 +94,9 @@ def load(folder: Path) -> tuple[list[dict], list[str], list[str]]:
                     "source": {"type": "base64", "media_type": "application/pdf", "data": _b64(path)},
                 })
                 loaded.append(name)
+                continue
+            elif suffix in IMAGE_TYPES and not images:
+                skipped.append(f"{name} (images are turned off)")
                 continue
             elif suffix in IMAGE_TYPES:
                 blocks.append({"type": "text", "text": f"Image research file: {name}"})

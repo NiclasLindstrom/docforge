@@ -6,7 +6,7 @@ the template's styles, headers, footers and headings; Claude writes what goes un
 
 ## Install (Windows / PowerShell)
 
-Requires Python 3.10+ (`winget install Python.Python.3.12`).
+Requires Python 3.11+ (`winget install Python.Python.3.12`).
 
 ```powershell
 cd docforge
@@ -74,7 +74,50 @@ Run `docforge inspect` to see exactly what was detected in a template.
 | `-o FILE` | output file |
 | `--body-style "Body Text"` | paragraph style for generated text, if the detected one is wrong |
 | `--from-json output\x.json` | re-render a previous result (after hand-editing the JSON, or with another `--body-style`) without calling the model |
-| `--model`, `--effort`, `--max-tokens` | model settings (default `claude-opus-5-5`, effort `high`, 64000) |
+| `--provider`, `--base-url`, `--model`, `--effort`, `--max-tokens` | model settings, see below |
+
+## Choosing the model / API
+
+By default docforge uses the Claude API (`claude-opus-5-5`, effort `high`) with the key in
+`ANTHROPIC_API_KEY`. It can instead use **any OpenAI-compatible API** (OpenAI, Azure OpenAI,
+OpenRouter, Mistral, Ollama, LM Studio, vLLM, llama.cpp, ...).
+
+Settings are read from, in order: command-line options, environment variables, then
+`docforge.toml` in the project folder (`docforge init` creates one with commented examples).
+
+| `docforge.toml` | Option | Environment variable | Meaning |
+|---|---|---|---|
+| `provider` | `--provider` | `DOCFORGE_PROVIDER` | `anthropic` or `openai`; defaults to `openai` when a base URL is set |
+| `base_url` | `--base-url` | `DOCFORGE_BASE_URL` | API address, e.g. `http://localhost:11434/v1` |
+| `model` | `--model` | `DOCFORGE_MODEL` | model name; required for `openai` |
+| `api_key_env` | | | name of the environment variable holding the key (default `DOCFORGE_API_KEY`, then `OPENAI_API_KEY`) |
+| `effort` | `--effort` | `DOCFORGE_EFFORT` | reasoning effort; only sent to OpenAI-compatible APIs when set |
+| `max_tokens` | `--max-tokens` | `DOCFORGE_MAX_TOKENS` | output limit; only sent to OpenAI-compatible APIs when set |
+| `json_mode` | `--json-mode` | `DOCFORGE_JSON_MODE` | `auto` (default), `schema`, `object` or `none` |
+| `send_images` | `--no-images` | | set `false` for models without vision |
+
+The API key itself is never stored in the file. Local servers that need no key work without one.
+
+Examples:
+
+```powershell
+# Ollama on this machine
+docforge build --base-url http://localhost:11434/v1 --model qwen3:32b
+
+# OpenAI
+$env:DOCFORGE_API_KEY = "sk-..."
+docforge build --provider openai --model gpt-5
+```
+
+Differences with an OpenAI-compatible API:
+
+- PDFs are converted to text locally (scanned PDFs without a text layer are skipped and reported).
+- With `json_mode = "auto"`, docforge asks for schema-constrained JSON and steps down to plain
+  JSON mode, then to prompt-only, if the server rejects the request.
+- Quality depends on the model. Small local models may ignore guidance text or return incomplete
+  sections; check the "Sections the model did not return" line after a build.
+- Local servers often default to a small context window (Ollama: a few thousand tokens), which
+  silently drops research. Raise it in the server's settings.
 
 ## Limitations
 
